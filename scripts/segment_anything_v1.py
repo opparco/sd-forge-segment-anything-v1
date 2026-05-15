@@ -348,6 +348,7 @@ def on_ui_tabs():
                 with gr.Row():
                     clear_button = gr.Button("Clear points", elem_id="segment_anything_clear_points")
                     generate_button = gr.Button("Generate mask", variant="primary", elem_id="segment_anything_generate_mask")
+                    export_inpaint_button = gr.Button("Export to inpaint", elem_id="segment_anything_export_inpaint")
                     auto_generate_button = gr.Button(
                         "Auto generate mask",
                         elem_id="segment_anything_auto_generate_mask",
@@ -356,7 +357,7 @@ def on_ui_tabs():
 
             with gr.Column(scale=1):
                 preview = gr.Image(label="Segment preview", type="pil")
-                mask = gr.Image(label="Mask", type="pil")
+                mask = gr.Image(label="Mask", type="pil", elem_id="segment_anything_mask")
                 status = gr.Textbox(label="Status", interactive=False, lines=3)
 
         with gr.Accordion("SAM model", open=True):

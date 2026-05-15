@@ -47,6 +47,106 @@
         return root.querySelector("img") || root.querySelector("canvas");
     }
 
+    function getComponentImageSrc(componentId) {
+        const root = gradioApp().getElementById(componentId);
+        const image = root?.querySelector("img");
+        return image?.src || null;
+    }
+
+    function loadImage(src) {
+        return new Promise((resolve, reject) => {
+            if (!src) {
+                reject(new Error("Missing image source."));
+                return;
+            }
+            const image = new Image();
+            image.onload = () => resolve(image);
+            image.onerror = () => reject(new Error("Could not load image source."));
+            image.src = src;
+        });
+    }
+
+    function imageToPngDataUrl(image) {
+        const canvas = document.createElement("canvas");
+        canvas.width = image.naturalWidth || image.width;
+        canvas.height = image.naturalHeight || image.height;
+        const ctx = canvas.getContext("2d");
+        ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
+        return canvas.toDataURL("image/png");
+    }
+
+    async function maskToForegroundDataUrl(maskSrc, width, height) {
+        const maskImage = await loadImage(maskSrc);
+        const sourceCanvas = document.createElement("canvas");
+        sourceCanvas.width = width;
+        sourceCanvas.height = height;
+        const sourceCtx = sourceCanvas.getContext("2d");
+        sourceCtx.drawImage(maskImage, 0, 0, width, height);
+        const sourceData = sourceCtx.getImageData(0, 0, width, height);
+
+        const foregroundCanvas = document.createElement("canvas");
+        foregroundCanvas.width = width;
+        foregroundCanvas.height = height;
+        const foregroundCtx = foregroundCanvas.getContext("2d");
+        const foregroundData = foregroundCtx.createImageData(width, height);
+
+        for (let i = 0; i < sourceData.data.length; i += 4) {
+            const alpha = Math.max(sourceData.data[i], sourceData.data[i + 1], sourceData.data[i + 2]);
+            foregroundData.data[i] = 255;
+            foregroundData.data[i + 1] = 255;
+            foregroundData.data[i + 2] = 255;
+            foregroundData.data[i + 3] = alpha;
+        }
+
+        foregroundCtx.putImageData(foregroundData, 0, 0);
+        return foregroundCanvas.toDataURL("image/png");
+    }
+
+    function findForgeCanvasUuid(elemId) {
+        const root = gradioApp().getElementById(elemId);
+        const container = root?.querySelector('[id^="container_uuid_"]');
+        return container?.id.replace("container_", "") || null;
+    }
+
+    function setForgeLogicalImage(uuid, className, dataUrl) {
+        const selector = `#${CSS.escape(uuid)}.${className} textarea`;
+        const textarea = gradioApp().querySelector(selector);
+        if (!textarea) return false;
+        textarea.value = dataUrl || "";
+        updateInput(textarea);
+        textarea.dispatchEvent(new Event("change", { bubbles: true }));
+        return true;
+    }
+
+    async function exportToInpaint() {
+        try {
+            const refImage = await loadImage(getComponentImageSrc("segment_anything_ref_image"));
+            const maskSrc = getComponentImageSrc("segment_anything_mask");
+            if (!maskSrc) throw new Error("Generate a mask before exporting.");
+
+            switch_to_inpaint();
+            const uuid = findForgeCanvasUuid("img2maskimg");
+            if (!uuid) throw new Error("Could not find ForgeCanvas inpaint target.");
+
+            const width = refImage.naturalWidth || refImage.width;
+            const height = refImage.naturalHeight || refImage.height;
+            const backgroundDataUrl = imageToPngDataUrl(refImage);
+            const foregroundDataUrl = await maskToForegroundDataUrl(maskSrc, width, height);
+
+            if (!setForgeLogicalImage(uuid, "logical_image_background", backgroundDataUrl)) {
+                throw new Error("Could not set ForgeCanvas background.");
+            }
+            if (!setForgeLogicalImage(uuid, "logical_image_foreground", foregroundDataUrl)) {
+                throw new Error("Could not set ForgeCanvas foreground.");
+            }
+
+            setTimeout(() => gradioApp().getElementById("img2img_detect_image_size_btn")?.click(), 500);
+        } catch (error) {
+            console.error("Segment Anything v1 export failed:", error);
+            alert(`Segment Anything v1 export failed: ${error.message}`);
+        }
+    }
+
     function naturalSize(el) {
         if (el instanceof HTMLImageElement) {
             return [el.naturalWidth || el.width, el.naturalHeight || el.height];
@@ -146,9 +246,17 @@
         });
     }
 
+    function attachExportHandler() {
+        const exportButton = gradioApp().getElementById("segment_anything_export_inpaint");
+        if (!exportButton || exportButton.dataset.segmentAnythingExportHandler === "true") return;
+        exportButton.dataset.segmentAnythingExportHandler = "true";
+        exportButton.addEventListener("click", exportToInpaint);
+    }
+
     function initSamMasker() {
         attachSamPointHandler();
         attachClearHandler();
+        attachExportHandler();
         readStateFromInputs();
         renderPoints();
     }
