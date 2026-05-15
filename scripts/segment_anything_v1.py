@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import tempfile
 import traceback
 from pathlib import Path
 
@@ -25,6 +26,7 @@ class CachedPredictor:
 
 _predictor_cache: dict[tuple[str, str, str], CachedPredictor] = {}
 _model_mapping: dict[str, str] = {}
+PARAMETER_SCHEMA_VERSION = 1
 
 
 def _scan_models() -> dict[str, str]:
@@ -107,6 +109,27 @@ def _parse_points(points_json: str, labels_json: str) -> tuple[np.ndarray, np.nd
     return np.asarray(points, dtype=np.float32), np.asarray(labels, dtype=np.int32)
 
 
+def _validated_points_payload(points_json: str, labels_json: str) -> tuple[list[list[int]], list[int]]:
+    points = json.loads(points_json or "[]")
+    labels = json.loads(labels_json or "[]")
+    if not isinstance(points, list) or not isinstance(labels, list):
+        raise ValueError("input_points and input_labels must be JSON arrays.")
+    if len(points) != len(labels):
+        raise ValueError("input_points and input_labels lengths differ.")
+
+    clean_points: list[list[int]] = []
+    clean_labels: list[int] = []
+    for point, label in zip(points, labels, strict=False):
+        if not isinstance(point, list | tuple) or len(point) != 2:
+            raise ValueError("Each point must be a two-value [x, y] array.")
+        point_x = int(round(float(point[0])))
+        point_y = int(round(float(point[1])))
+        clean_points.append([point_x, point_y])
+        clean_labels.append(1 if int(label) == 1 else 0)
+
+    return clean_points, clean_labels
+
+
 def _mask_image(mask: np.ndarray) -> Image.Image:
     return Image.fromarray((mask.astype(np.uint8) * 255), mode="L")
 
@@ -147,6 +170,118 @@ def _overlay_image(image: Image.Image, mask: np.ndarray, points: np.ndarray, lab
 
 def clear_points() -> tuple[str, str, None, None, str]:
     return "[]", "[]", None, None, "Cleared points."
+
+
+def _uploaded_file_path(uploaded_file: object) -> Path:
+    if uploaded_file is None:
+        raise ValueError("Select a parameters JSON file first.")
+    if isinstance(uploaded_file, str):
+        return Path(uploaded_file)
+    if isinstance(uploaded_file, dict):
+        path = uploaded_file.get("path") or uploaded_file.get("name")
+        if path:
+            return Path(path)
+    path = getattr(uploaded_file, "path", None) or getattr(uploaded_file, "name", None)
+    if path:
+        return Path(path)
+    raise ValueError("Could not read uploaded parameters file path.")
+
+
+def save_parameters(
+    model_choice: str | None,
+    model_type: str,
+    device: str,
+    multimask_output: bool,
+    dilate_pixels: int,
+    erode_pixels: int,
+    points_json: str,
+    labels_json: str,
+) -> tuple[str | None, str]:
+    try:
+        points, labels = _validated_points_payload(points_json, labels_json)
+        payload = {
+            "schema_version": PARAMETER_SCHEMA_VERSION,
+            "checkpoint": model_choice,
+            "model_type": model_type,
+            "device": device,
+            "multimask_output": bool(multimask_output),
+            "postprocess": {
+                "dilate_pixels": int(dilate_pixels),
+                "erode_pixels": int(erode_pixels),
+            },
+            "input_points": points,
+            "input_labels": labels,
+        }
+
+        output = tempfile.NamedTemporaryFile(
+            mode="w",
+            suffix=".json",
+            prefix="segment-anything-v1-",
+            delete=False,
+            encoding="utf-8",
+        )
+        with output:
+            json.dump(payload, output, indent=2)
+            output.write("\n")
+        return output.name, f"Saved parameters with {len(points)} point(s)."
+    except Exception as exc:
+        traceback.print_exc()
+        return None, f"Error saving parameters: {exc}"
+
+
+def load_parameters(uploaded_file: object):
+    try:
+        path = _uploaded_file_path(uploaded_file)
+        with path.open("r", encoding="utf-8") as file:
+            payload = json.load(file)
+
+        points, labels = _validated_points_payload(
+            json.dumps(payload.get("input_points", [])),
+            json.dumps(payload.get("input_labels", [])),
+        )
+
+        refresh_models()
+        choices = list(_model_mapping)
+        checkpoint = payload.get("checkpoint")
+        checkpoint_value = checkpoint if checkpoint in _model_mapping else next(iter(_model_mapping), None)
+
+        model_type = payload.get("model_type", "auto")
+        if model_type not in {"auto", "vit_b", "vit_l", "vit_h"}:
+            model_type = "auto"
+
+        device = str(payload.get("device", "auto") or "auto")
+        postprocess = payload.get("postprocess") or {}
+        dilate_pixels = int(postprocess.get("dilate_pixels", 0))
+        erode_pixels = int(postprocess.get("erode_pixels", 0))
+
+        message = f"Loaded parameters with {len(points)} point(s)."
+        if checkpoint and checkpoint not in _model_mapping:
+            message += f"\nCheckpoint not found in {SAM_MODEL_DIR}: {checkpoint}"
+
+        return (
+            gr.update(choices=choices, value=checkpoint_value),
+            gr.update(value=model_type),
+            gr.update(value=device),
+            gr.update(value=bool(payload.get("multimask_output", True))),
+            gr.update(value=max(0, min(128, dilate_pixels))),
+            gr.update(value=max(0, min(128, erode_pixels))),
+            json.dumps(points),
+            json.dumps(labels),
+            message,
+        )
+    except Exception as exc:
+        traceback.print_exc()
+        return (
+            gr.skip(),
+            gr.skip(),
+            gr.skip(),
+            gr.skip(),
+            gr.skip(),
+            gr.skip(),
+            gr.skip(),
+            gr.skip(),
+            f"Error loading parameters: {exc}",
+        )
 
 
 def generate_mask(
@@ -250,6 +385,13 @@ def on_ui_tabs():
                     label="Erode mask",
                 )
 
+        with gr.Accordion("Parameters", open=False):
+            params_file = gr.File(label="Parameters JSON", file_types=[".json"], type="filepath")
+            with gr.Row():
+                load_params_button = gr.Button("Load parameters")
+                save_params_button = gr.Button("Save parameters")
+            saved_params_file = gr.File(label="Saved parameters", interactive=False)
+
         mask_inputs = [
             ref_image,
             input_points,
@@ -265,6 +407,35 @@ def on_ui_tabs():
         auto_generate_button.click(generate_mask, inputs=mask_inputs, outputs=[preview, mask, status])
         clear_button.click(clear_points, outputs=[input_points, input_labels, preview, mask, status])
         refresh_button.click(refresh_models, outputs=[model_choice])
+        save_params_button.click(
+            save_parameters,
+            inputs=[
+                model_choice,
+                model_type,
+                device,
+                multimask_output,
+                dilate_pixels,
+                erode_pixels,
+                input_points,
+                input_labels,
+            ],
+            outputs=[saved_params_file, status],
+        )
+        load_params_button.click(
+            load_parameters,
+            inputs=[params_file],
+            outputs=[
+                model_choice,
+                model_type,
+                device,
+                multimask_output,
+                dilate_pixels,
+                erode_pixels,
+                input_points,
+                input_labels,
+                status,
+            ],
+        )
 
     return ((tab, TITLE, "segment_anything_v1"),)
 
