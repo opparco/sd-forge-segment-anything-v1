@@ -6,6 +6,7 @@ import traceback
 from pathlib import Path
 
 import gradio as gr
+import cv2
 import numpy as np
 import torch
 from PIL import Image
@@ -110,6 +111,19 @@ def _mask_image(mask: np.ndarray) -> Image.Image:
     return Image.fromarray((mask.astype(np.uint8) * 255), mode="L")
 
 
+def _postprocess_mask(mask: np.ndarray, dilate_pixels: int, erode_pixels: int) -> np.ndarray:
+    processed = mask.astype(np.uint8)
+    if dilate_pixels > 0:
+        kernel_size = dilate_pixels * 2 + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+        processed = cv2.dilate(processed, kernel, iterations=1)
+    if erode_pixels > 0:
+        kernel_size = erode_pixels * 2 + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+        processed = cv2.erode(processed, kernel, iterations=1)
+    return processed.astype(bool)
+
+
 def _overlay_image(image: Image.Image, mask: np.ndarray, points: np.ndarray, labels: np.ndarray) -> Image.Image:
     base = image.convert("RGBA")
     overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
@@ -143,6 +157,8 @@ def generate_mask(
     model_type: str,
     device: str,
     multimask_output: bool,
+    dilate_pixels: int,
+    erode_pixels: int,
 ) -> tuple[Image.Image | None, Image.Image | None, str]:
     if image is None:
         return None, None, "Load a reference image first."
@@ -172,10 +188,13 @@ def generate_mask(
             multimask_output=multimask_output,
         )
         best_index = int(np.argmax(scores))
-        mask = masks[best_index]
+        mask = _postprocess_mask(masks[best_index], int(dilate_pixels), int(erode_pixels))
 
         preview = _overlay_image(image, mask, points, labels)
-        status = f"Generated mask from {len(points)} point(s). Score: {float(scores[best_index]):.4f}"
+        status = (
+            f"Generated mask from {len(points)} point(s). Score: {float(scores[best_index]):.4f}"
+            f"\nPostprocess: dilate {int(dilate_pixels)} px, erode {int(erode_pixels)} px."
+        )
         return preview, _mask_image(mask), status
     except Exception as exc:
         traceback.print_exc()
@@ -214,7 +233,34 @@ def on_ui_tabs():
                 refresh_button = gr.Button("Refresh models")
                 multimask_output = gr.Checkbox(label="Use SAM multimask output", value=True)
 
-        mask_inputs = [ref_image, input_points, input_labels, model_choice, model_type, device, multimask_output]
+        with gr.Accordion("Postprocess", open=False):
+            with gr.Row():
+                dilate_pixels = gr.Slider(
+                    minimum=0,
+                    maximum=128,
+                    value=0,
+                    step=1,
+                    label="Dilate mask",
+                )
+                erode_pixels = gr.Slider(
+                    minimum=0,
+                    maximum=128,
+                    value=0,
+                    step=1,
+                    label="Erode mask",
+                )
+
+        mask_inputs = [
+            ref_image,
+            input_points,
+            input_labels,
+            model_choice,
+            model_type,
+            device,
+            multimask_output,
+            dilate_pixels,
+            erode_pixels,
+        ]
         generate_button.click(generate_mask, inputs=mask_inputs, outputs=[preview, mask, status])
         auto_generate_button.click(generate_mask, inputs=mask_inputs, outputs=[preview, mask, status])
         clear_button.click(clear_points, outputs=[input_points, input_labels, preview, mask, status])
