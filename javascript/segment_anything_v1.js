@@ -91,11 +91,11 @@
         const foregroundData = foregroundCtx.createImageData(width, height);
 
         for (let i = 0; i < sourceData.data.length; i += 4) {
-            const alpha = Math.max(sourceData.data[i], sourceData.data[i + 1], sourceData.data[i + 2]);
-            foregroundData.data[i] = 255;
-            foregroundData.data[i + 1] = 255;
-            foregroundData.data[i + 2] = 255;
-            foregroundData.data[i + 3] = alpha;
+            const mask = sourceData.data[i] >= 128 ? 255 : 0;
+            foregroundData.data[i] = 0;
+            foregroundData.data[i + 1] = 0;
+            foregroundData.data[i + 2] = 0;
+            foregroundData.data[i + 3] = mask;
         }
 
         foregroundCtx.putImageData(foregroundData, 0, 0);
