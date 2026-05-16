@@ -27,6 +27,9 @@ class CachedPredictor:
 _predictor_cache: dict[tuple[str, str, str], CachedPredictor] = {}
 _model_mapping: dict[str, str] = {}
 PARAMETER_SCHEMA_VERSION = 1
+POSTPROCESS_ORDER_DILATE_ERODE = "Dilate then erode"
+POSTPROCESS_ORDER_ERODE_DILATE = "Erode then dilate"
+POSTPROCESS_ORDER_CHOICES = [POSTPROCESS_ORDER_DILATE_ERODE, POSTPROCESS_ORDER_ERODE_DILATE]
 
 
 def _scan_models() -> dict[str, str]:
@@ -134,16 +137,32 @@ def _mask_image(mask: np.ndarray) -> Image.Image:
     return Image.fromarray((mask.astype(np.uint8) * 255), mode="L")
 
 
-def _postprocess_mask(mask: np.ndarray, dilate_pixels: int, erode_pixels: int) -> np.ndarray:
+def _apply_morphology(processed: np.ndarray, operation: str, pixels: int) -> np.ndarray:
+    if pixels <= 0:
+        return processed
+    kernel_size = pixels * 2 + 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    if operation == "dilate":
+        return cv2.dilate(processed, kernel, iterations=1)
+    return cv2.erode(processed, kernel, iterations=1)
+
+
+def _normalize_postprocess_order(postprocess_order: str | None) -> str:
+    if postprocess_order in POSTPROCESS_ORDER_CHOICES:
+        return postprocess_order
+    return POSTPROCESS_ORDER_DILATE_ERODE
+
+
+def _postprocess_mask(mask: np.ndarray, dilate_pixels: int, erode_pixels: int, postprocess_order: str | None) -> np.ndarray:
     processed = mask.astype(np.uint8)
-    if dilate_pixels > 0:
-        kernel_size = dilate_pixels * 2 + 1
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
-        processed = cv2.dilate(processed, kernel, iterations=1)
-    if erode_pixels > 0:
-        kernel_size = erode_pixels * 2 + 1
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
-        processed = cv2.erode(processed, kernel, iterations=1)
+    postprocess_order = _normalize_postprocess_order(postprocess_order)
+    if postprocess_order == POSTPROCESS_ORDER_ERODE_DILATE:
+        processed = _apply_morphology(processed, "erode", erode_pixels)
+        processed = _apply_morphology(processed, "dilate", dilate_pixels)
+        return processed.astype(bool)
+
+    processed = _apply_morphology(processed, "dilate", dilate_pixels)
+    processed = _apply_morphology(processed, "erode", erode_pixels)
     return processed.astype(bool)
 
 
@@ -194,6 +213,7 @@ def save_parameters(
     multimask_output: bool,
     dilate_pixels: int,
     erode_pixels: int,
+    postprocess_order: str,
     points_json: str,
     labels_json: str,
 ) -> tuple[str | None, str]:
@@ -208,6 +228,7 @@ def save_parameters(
             "postprocess": {
                 "dilate_pixels": int(dilate_pixels),
                 "erode_pixels": int(erode_pixels),
+                "order": _normalize_postprocess_order(postprocess_order),
             },
             "input_points": points,
             "input_labels": labels,
@@ -253,6 +274,7 @@ def load_parameters(uploaded_file: object):
         postprocess = payload.get("postprocess") or {}
         dilate_pixels = int(postprocess.get("dilate_pixels", 0))
         erode_pixels = int(postprocess.get("erode_pixels", 0))
+        postprocess_order = _normalize_postprocess_order(postprocess.get("order"))
 
         message = f"Loaded parameters with {len(points)} point(s)."
         if checkpoint and checkpoint not in _model_mapping:
@@ -265,6 +287,7 @@ def load_parameters(uploaded_file: object):
             gr.update(value=bool(payload.get("multimask_output", True))),
             gr.update(value=max(0, min(128, dilate_pixels))),
             gr.update(value=max(0, min(128, erode_pixels))),
+            gr.update(value=postprocess_order),
             json.dumps(points),
             json.dumps(labels),
             message,
@@ -272,6 +295,7 @@ def load_parameters(uploaded_file: object):
     except Exception as exc:
         traceback.print_exc()
         return (
+            gr.skip(),
             gr.skip(),
             gr.skip(),
             gr.skip(),
@@ -294,6 +318,7 @@ def generate_mask(
     multimask_output: bool,
     dilate_pixels: int,
     erode_pixels: int,
+    postprocess_order: str,
 ) -> tuple[Image.Image | None, Image.Image | None, str]:
     if image is None:
         return None, None, "Load a reference image first."
@@ -323,12 +348,13 @@ def generate_mask(
             multimask_output=multimask_output,
         )
         best_index = int(np.argmax(scores))
-        mask = _postprocess_mask(masks[best_index], int(dilate_pixels), int(erode_pixels))
+        postprocess_order = _normalize_postprocess_order(postprocess_order)
+        mask = _postprocess_mask(masks[best_index], int(dilate_pixels), int(erode_pixels), postprocess_order)
 
         preview = _overlay_image(image, mask, points, labels)
         status = (
             f"Generated mask from {len(points)} point(s). Score: {float(scores[best_index]):.4f}"
-            f"\nPostprocess: dilate {int(dilate_pixels)} px, erode {int(erode_pixels)} px."
+            f"\nPostprocess: {postprocess_order}, dilate {int(dilate_pixels)} px, erode {int(erode_pixels)} px."
         )
         return preview, _mask_image(mask), status
     except Exception as exc:
@@ -385,6 +411,11 @@ def on_ui_tabs():
                     step=1,
                     label="Erode mask",
                 )
+                postprocess_order = gr.Dropdown(
+                    choices=POSTPROCESS_ORDER_CHOICES,
+                    value=POSTPROCESS_ORDER_DILATE_ERODE,
+                    label="Order",
+                )
 
         with gr.Accordion("Parameters", open=False):
             params_file = gr.File(label="Parameters JSON", file_types=[".json"], type="filepath")
@@ -403,6 +434,7 @@ def on_ui_tabs():
             multimask_output,
             dilate_pixels,
             erode_pixels,
+            postprocess_order,
         ]
         generate_button.click(generate_mask, inputs=mask_inputs, outputs=[preview, mask, status])
         auto_generate_button.click(generate_mask, inputs=mask_inputs, outputs=[preview, mask, status])
@@ -417,6 +449,7 @@ def on_ui_tabs():
                 multimask_output,
                 dilate_pixels,
                 erode_pixels,
+                postprocess_order,
                 input_points,
                 input_labels,
             ],
@@ -432,6 +465,7 @@ def on_ui_tabs():
                 multimask_output,
                 dilate_pixels,
                 erode_pixels,
+                postprocess_order,
                 input_points,
                 input_labels,
                 status,
